@@ -16,7 +16,7 @@ from rtlsdr import RtlSdr
 # =========================
 KAL_CHAN = 175
 KAL_GAIN = 49
-KAL_EVERY_S = 30
+KAL_EVERY_S = 300
 
 CSV_PATH = Path("/workspace/data/ppm_log.csv")
 
