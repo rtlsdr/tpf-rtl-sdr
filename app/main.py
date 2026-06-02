@@ -1,9 +1,7 @@
-import csv
 import datetime as dt
 import re
 import subprocess
 import time
-from pathlib import Path
 
 import matplotlib.animation as animation
 from matplotlib import pyplot as plt
@@ -16,79 +14,35 @@ from rtlsdr import RtlSdr
 # =========================
 KAL_CHAN = 175
 KAL_GAIN = 49
-KAL_EVERY_S = 300
-
-CSV_PATH = Path("/workspace/data/ppm_log.csv")
+KAL_EVERY_S = 2 * 60 * 60   # cada 2 horas
 
 CENTER_FREQ_HZ = 102.3e6
 SAMPLE_RATE_HZ = 2.4e6
 SDR_GAIN_DB = 40
 INITIAL_PPM = 2
 
-# Parámetros Welch
 SEG = 1024
 OVERLAP = 0.5
 STEP = int(SEG * (1 - OVERLAP))
-
-# Si en el informe van a justificar Hamming, usen Hamming:
 WIN = np.hamming(SEG)
-
-# Si prefieren mantener exactamente lo que ya tenían, era Hann:
-# WIN = np.hanning(SEG)
-
 WIN_POW = (WIN**2).sum()
-
 N = 65536
 
 
 # =========================
-# CSV
+# TIEMPO
 # =========================
-def append_csv_row(row: dict):
-    CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    exists = CSV_PATH.exists()
-
-    with CSV_PATH.open("a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=row.keys())
-        if not exists:
-            w.writeheader()
-        w.writerow(row)
-
-
 def now_iso_local():
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 # =========================
-# SDR
+# KALIBRATE
 # =========================
-def open_sdr():
-    sdr = RtlSdr()
-
-    sdr.sample_rate = SAMPLE_RATE_HZ
-    sdr.center_freq = CENTER_FREQ_HZ
-
-    try:
-        sdr.freq_correction = INITIAL_PPM
-    except Exception as e:
-        print("[WARN] No pude setear freq_correction:", repr(e), flush=True)
-
-    try:
-        sdr.gain = SDR_GAIN_DB
-    except Exception as e:
-        print("[WARN] No pude setear gain:", repr(e), flush=True)
-
-    return sdr
-
-
-# =========================
-# KALIBRATE EN LINUX
-# =========================
-def kal_once(timeout_s=45) -> float | None:
+def kal_once(timeout_s=60) -> float | None:
     cmd = ["kal", "-c", str(KAL_CHAN), "-g", str(KAL_GAIN)]
 
-    print("[KAL] ejecutando:", " ".join(cmd), flush=True)
+    print("\n[KAL] ejecutando:", " ".join(cmd), flush=True)
 
     try:
         p = subprocess.run(
@@ -100,6 +54,9 @@ def kal_once(timeout_s=45) -> float | None:
         )
     except subprocess.TimeoutExpired:
         print("[KAL] TIMEOUT", flush=True)
+        return None
+    except FileNotFoundError:
+        print("[KAL] ERROR: no se encontró el comando 'kal'", flush=True)
         return None
 
     out = (p.stdout or "") + "\n" + (p.stderr or "")
@@ -120,7 +77,58 @@ def kal_once(timeout_s=45) -> float | None:
         print(out, flush=True)
         return None
 
-    return float(m.group(1))
+    ppm = float(m.group(1))
+    print(f"[KAL] ppm medido = {ppm:+.3f}", flush=True)
+    return ppm
+
+
+# =========================
+# SDR
+# =========================
+current_ppm = INITIAL_PPM
+
+
+def open_sdr(ppm_correction: float, retries: int = 5):
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            sdr = RtlSdr()
+
+            sdr.sample_rate = SAMPLE_RATE_HZ
+            sdr.center_freq = CENTER_FREQ_HZ
+
+            try:
+                ppm_int = int(round(ppm_correction))
+                sdr.freq_correction = ppm_int
+                print(f"[SDR] freq_correction aplicado = {ppm_int:+d} ppm", flush=True)
+            except Exception as e:
+                print("[WARN] No pude setear freq_correction:", repr(e), flush=True)
+
+            try:
+                sdr.gain = SDR_GAIN_DB
+            except Exception as e:
+                print("[WARN] No pude setear gain:", repr(e), flush=True)
+
+            return sdr
+
+        except Exception as e:
+            last_error = e
+            print(f"[SDR OPEN] intento {attempt}/{retries} falló: {repr(e)}", flush=True)
+            time.sleep(2.0)
+
+    raise last_error
+
+
+def close_sdr():
+    global sdr
+
+    if sdr is not None:
+        try:
+            sdr.close()
+        except Exception:
+            pass
+        sdr = None
 
 
 # =========================
@@ -134,7 +142,7 @@ Fs = None
 freqs_w = None
 
 t0 = time.time()
-next_kal = t0 + KAL_EVERY_S
+next_kal = None
 
 
 def setup_plot():
@@ -145,70 +153,62 @@ def setup_plot():
 
     ax.set_xlabel("Frecuencia relativa al centro (MHz)")
     ax.set_ylabel("PSD (dB)")
-    ax.set_title(
-        f"Welch en vivo — fs={Fs/1e6:.1f} MS/s | "
-        f"fc={sdr.center_freq/1e6:.4f} MHz | kal cada {KAL_EVERY_S}s"
-    )
-
     ax.set_xlim(freqs_w[0], freqs_w[-1])
     ax.set_ylim(-120, -30)
     ax.grid(True, alpha=0.3)
+    update_title()
 
 
+def update_title():
+    ax.set_title(
+        f"Welch en vivo — fs={Fs/1e6:.1f} MS/s | "
+        f"fc={CENTER_FREQ_HZ/1e6:.4f} MHz | "
+        f"corr={current_ppm:+.2f} ppm | kal cada {KAL_EVERY_S/3600:.1f} h"
+    )
+
+
+# =========================
+# CICLO KALIBRATE
+# =========================
 def run_kalibrate_cycle():
-    global sdr, next_kal, Fs
+    global sdr, Fs, current_ppm, next_kal
 
     elapsed = int(time.time() - t0)
-    print(f"\n=== KAL CYCLE START t={elapsed}s ===", flush=True)
+    print(f"\n=== KAL CYCLE START t={elapsed}s | {now_iso_local()} ===", flush=True)
 
-    ppm = None
+    print("[1] Cerrando SDR para liberar USB", flush=True)
+    close_sdr()
 
+    time.sleep(3.0)
+
+    print("[2] Ejecutando kalibrate", flush=True)
+    ppm = kal_once(timeout_s=60)
+
+    if ppm is not None:
+        current_ppm = ppm
+        print(f"[KAL] Nuevo ppm para corrección = {current_ppm:+.3f}", flush=True)
+    else:
+        print(f"[KAL] Sin dato válido. Mantengo ppm anterior = {current_ppm:+.3f}", flush=True)
+
+    print("[3] Esperando liberación USB", flush=True)
+    time.sleep(5.0)
+
+    print("[4] Reabriendo SDR con corrección actualizada", flush=True)
     try:
-        print("[1] cerrando SDR", flush=True)
-        if sdr is not None:
-            try:
-                sdr.close()
-            except Exception:
-                pass
+        sdr = open_sdr(current_ppm)
+        Fs = sdr.sample_rate
+    except Exception as e:
+        print("[SDR OPEN FAIL]", repr(e), flush=True)
         sdr = None
 
-        time.sleep(1.0)
+    next_kal = time.time() + KAL_EVERY_S
 
-        print("[2] corriendo kalibrate dentro de Linux/Docker", flush=True)
-        ppm = kal_once(timeout_s=45)
-
-        append_csv_row({
-            "iso_time": now_iso_local(),
-            "uptime_s": elapsed,
-            "ppm": "" if ppm is None else ppm,
-            "kal_chan": KAL_CHAN,
-            "kal_gain": KAL_GAIN,
-            "status": "ok" if ppm is not None else "no_ppm",
-        })
-
-        print(f"[KAL] t={elapsed}s -> ppm={ppm if ppm is not None else 'sin dato'}", flush=True)
-
-    except Exception as e:
-        print("[KAL ERROR] desactivando scheduler:", repr(e), flush=True)
-        next_kal = float("inf")
-
-    finally:
-        time.sleep(1.0)
-
-        print("[3] reabriendo SDR", flush=True)
-        try:
-            sdr = open_sdr()
-            Fs = sdr.sample_rate
-        except Exception as e_open:
-            print("[SDR OPEN FAIL]", repr(e_open), flush=True)
-            sdr = None
-
-        if next_kal != float("inf"):
-            next_kal = time.time() + KAL_EVERY_S
-
-    print("=== KAL CYCLE END ===\n", flush=True)
+    print(f"=== KAL CYCLE END | próximo kal en {KAL_EVERY_S/3600:.1f} h ===\n", flush=True)
 
 
+# =========================
+# ANIMACIÓN
+# =========================
 def animate(_):
     global sdr, Fs, line, next_kal
 
@@ -216,22 +216,19 @@ def animate(_):
         ani.event_source.stop()
         try:
             run_kalibrate_cycle()
-        except Exception as e:
-            print("[KAL ERROR] desactivando scheduler:", repr(e), flush=True)
-            next_kal = float("inf")
+            if sdr is not None:
+                update_title()
         finally:
             ani.event_source.start()
-
-        if sdr is not None:
-            ax.set_title(
-                f"Welch en vivo — fs={Fs/1e6:.1f} MS/s | "
-                f"fc={sdr.center_freq/1e6:.4f} MHz | kal cada {KAL_EVERY_S}s"
-            )
 
     if sdr is None:
         return (line,)
 
-    x = sdr.read_samples(N)
+    try:
+        x = sdr.read_samples(N)
+    except Exception as e:
+        print("[SDR READ ERROR]", repr(e), flush=True)
+        return (line,)
 
     psd_acc = np.zeros(SEG, dtype=np.float64)
     count = 0
@@ -252,7 +249,6 @@ def animate(_):
     mag_db = 10.0 * np.log10(psd + 1e-20)
 
     line.set_ydata(mag_db)
-
     return (line,)
 
 
@@ -260,8 +256,25 @@ def animate(_):
 # MAIN
 # =========================
 try:
-    sdr = open_sdr()
+    print("=== CALIBRACIÓN INICIAL CON KALIBRATE ===", flush=True)
+
+    ppm0 = kal_once(timeout_s=60)
+
+    if ppm0 is not None:
+        current_ppm = ppm0
+    else:
+        print(f"[KAL] Falló kal inicial. Uso fallback = {INITIAL_PPM:+.3f} ppm", flush=True)
+        current_ppm = INITIAL_PPM
+
+    print(f"[MAIN] Corrección inicial = {current_ppm:+.3f} ppm", flush=True)
+
+    print("[MAIN] Esperando liberación USB antes de abrir SDR", flush=True)
+    time.sleep(5.0)
+
+    sdr = open_sdr(current_ppm)
     Fs = sdr.sample_rate
+
+    next_kal = time.time() + KAL_EVERY_S
 
     setup_plot()
 
@@ -272,8 +285,4 @@ except KeyboardInterrupt:
     pass
 
 finally:
-    try:
-        if sdr is not None:
-            sdr.close()
-    except Exception:
-        pass
+    close_sdr()

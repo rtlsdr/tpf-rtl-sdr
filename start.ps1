@@ -12,61 +12,38 @@ $isAdmin = ([Security.Principal.WindowsPrincipal] `
 ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 if (-not $isAdmin) {
-    Write-Host "ERROR: ejecutar este script desde PowerShell como administrador." -ForegroundColor Red
+    Write-Host "ERROR: ejecutá este script desde PowerShell como administrador." -ForegroundColor Red
     exit 1
 }
 
-function Get-UsbipdExe {
-    $cmd = Get-Command usbipd -ErrorAction SilentlyContinue
-    if ($cmd) {
-        return $cmd.Source
-    }
-
-    $candidate = "C:\Program Files\usbipd-win\usbipd.exe"
-    if (Test-Path $candidate) {
-        return $candidate
-    }
-
-    return $null
-}
-
-$UsbipdExe = Get-UsbipdExe
-
-if (-not $UsbipdExe) {
-    Write-Host "ERROR: usbipd-win no esta instalado o no esta disponible en PATH." -ForegroundColor Red
-    Write-Host "Ejecutar setup.ps1. Si ya se instalo, cerrar PowerShell y abrirlo nuevamente como administrador."
+# Verificar usbipd
+try {
+    usbipd --version | Out-Null
+} catch {
+    Write-Host "ERROR: usbipd-win no está instalado. Ejecutá setup.ps1 primero." -ForegroundColor Red
     exit 1
 }
 
 # Verificar Docker
-docker info | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: Docker Desktop no esta corriendo. Abrir Docker Desktop y volver a intentar." -ForegroundColor Red
+try {
+    docker info | Out-Null
+} catch {
+    Write-Host "ERROR: Docker Desktop no está corriendo. Abrí Docker Desktop y volvé a intentar." -ForegroundColor Red
     exit 1
 }
 
-# Iniciar Ubuntu
+# Iniciar WSL
 Write-Host "[1/5] Iniciando Ubuntu/WSL..." -ForegroundColor Cyan
 wsl -d Ubuntu -- echo WSL_OK | Out-Null
 
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: no se pudo iniciar Ubuntu/WSL." -ForegroundColor Red
-    exit 1
-}
-
-# Dejar Ubuntu como distro default para evitar que usbipd elija docker-desktop
-wsl --set-default Ubuntu | Out-Null
-
 # Buscar RTL-SDR
 Write-Host "[2/5] Buscando RTL-SDR..." -ForegroundColor Cyan
-$usbipdOutput = & $UsbipdExe list
-Write-Host $usbipdOutput
-
+$usbipdOutput = usbipd list
 $rtlLine = $usbipdOutput | Select-String -Pattern "0bda:2838"
 
 if (-not $rtlLine) {
-    Write-Host "ERROR: no se encontro un RTL-SDR con VID:PID 0bda:2838." -ForegroundColor Red
-    Write-Host "Conectar el dongle y ejecutar start.ps1 nuevamente."
+    Write-Host "ERROR: no se encontró un RTL-SDR con VID:PID 0bda:2838." -ForegroundColor Red
+    Write-Host "Conectá el dongle y ejecutá start.ps1 nuevamente."
     exit 1
 }
 
@@ -77,31 +54,18 @@ Write-Host "RTL-SDR encontrado en BUSID: $busid" -ForegroundColor Green
 
 # Adjuntar USB a WSL
 Write-Host "[3/5] Adjuntando RTL-SDR a WSL..." -ForegroundColor Cyan
-
-& $UsbipdExe bind --busid $busid | Out-Null
-
-# Si no estaba adjuntado, detach puede mostrar advertencia. No es grave.
-& $UsbipdExe detach --busid $busid | Out-Null
-
-& $UsbipdExe attach --wsl --busid $busid
-
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: no se pudo adjuntar el RTL-SDR a WSL." -ForegroundColor Red
-    Write-Host "Probar desconectar y reconectar el dongle, y ejecutar start.ps1 nuevamente."
-    exit 1
-}
+usbipd bind --busid $busid | Out-Null
+usbipd attach --wsl --busid $busid
 
 Start-Sleep -Seconds 2
 
-# Verificar que Docker vea el RTL-SDR
-Write-Host "[4/5] Verificando RTL-SDR dentro de Docker..." -ForegroundColor Cyan
-
-wsl -d Ubuntu -- bash -lc "cd ~/tpf-rtl-sdr && docker compose run --rm rtl-sdr lsusb | grep -i '0bda:2838'"
-
+# Verificar que WSL lo vea
+Write-Host "[4/5] Verificando RTL-SDR dentro de WSL..." -ForegroundColor Cyan
+wsl -d Ubuntu -- bash -lc "lsusb | grep -i '0bda:2838'"
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
-    Write-Host "ERROR: Docker no detecta el RTL-SDR." -ForegroundColor Red
-    Write-Host "Probar desconectar y reconectar el dongle, y ejecutar start.ps1 nuevamente."
+    Write-Host "ERROR: Ubuntu/WSL no detecta el RTL-SDR." -ForegroundColor Red
+    Write-Host "Probá desconectar y reconectar el dongle, y ejecutá start.ps1 nuevamente."
     exit 1
 }
 
