@@ -95,17 +95,46 @@ if ($LASTEXITCODE -ne 0) {
 
 # Verificar usbipd-win
 Write-Host "[6/8] Verificando usbipd-win..." -ForegroundColor Cyan
-usbipd --version | Out-Null
-if ($LASTEXITCODE -ne 0) {
+
+function Get-UsbipdExe {
+    $cmd = Get-Command usbipd -ErrorAction SilentlyContinue
+    if ($cmd) {
+        return $cmd.Source
+    }
+
+    $candidate = "C:\Program Files\usbipd-win\usbipd.exe"
+    if (Test-Path $candidate) {
+        return $candidate
+    }
+
+    return $null
+}
+
+$UsbipdExe = Get-UsbipdExe
+
+if (-not $UsbipdExe) {
     Write-Host "usbipd-win no detectado. Instalando..." -ForegroundColor Yellow
     winget install --interactive --exact dorssel.usbipd-win
 
-    Write-Host ""
-    Write-Host "Si la instalacion de usbipd-win pidio reiniciar, reiniciar Windows." -ForegroundColor Yellow
-    Write-Host "Luego ejecutar setup.ps1 nuevamente." -ForegroundColor Yellow
-    exit 0
+    $UsbipdExe = Get-UsbipdExe
+
+    if (-not $UsbipdExe) {
+        Write-Host ""
+        Write-Host "usbipd-win fue instalado o está pendiente de instalación, pero todavía no está disponible en PATH." -ForegroundColor Yellow
+        Write-Host "Cerrá PowerShell, abrilo nuevamente como administrador y ejecutá setup.ps1 otra vez."
+        Write-Host "Si Windows pide reiniciar, reiniciá antes de volver a ejecutar setup.ps1."
+        exit 0
+    }
 }
-Write-Host "usbipd-win detectado." -ForegroundColor Green
+
+& $UsbipdExe --version | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: usbipd-win está instalado pero no responde correctamente." -ForegroundColor Red
+    Write-Host "Probá cerrar y abrir PowerShell como administrador, o reinstalar usbipd-win."
+    exit 1
+}
+
+Write-Host "usbipd-win detectado: $UsbipdExe" -ForegroundColor Green
 
 # Iniciar Ubuntu
 Write-Host "[7/8] Iniciando Ubuntu/WSL y copiando proyecto..." -ForegroundColor Cyan
